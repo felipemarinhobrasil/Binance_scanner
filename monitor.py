@@ -93,7 +93,42 @@ CONFIG = {
     "INCLUDE_LEVERAGED": _get_bool("INCLUDE_LEVERAGED", False),
     "BATCH_SIZE": _get_int("BATCH_SIZE", 800),
     "USE_TESTNET": _IS_TESTNET,
+    "MOMENTUM_SENSITIVITY": _get_float("MOMENTUM_SENSITIVITY", 1.0),
 }
+
+
+def _apply_momentum_sensitivity() -> None:
+    """Ajusta thresholds do scanner de acordo com a sensibilidade configurada."""
+    sens_raw = CONFIG.get("MOMENTUM_SENSITIVITY", 1.0)
+    try:
+        sens = float(sens_raw)
+    except Exception:
+        sens = 1.0
+    sens = max(0.3, min(sens, 2.0))
+    CONFIG["MOMENTUM_SENSITIVITY"] = sens
+    if abs(sens - 1.0) < 1e-6:
+        return
+    base_threshold = CONFIG["THRESHOLD_PCT"]
+    base_volume = CONFIG["VOLUME_MULTIPLIER"]
+    base_pre_cd = CONFIG["PRE_SIGNAL_COOLDOWN"]
+    base_cd = CONFIG["COOLDOWN_PER_SYMBOL"]
+    CONFIG["THRESHOLD_PCT"] = max(0.0005, round(base_threshold * sens, 6))
+    if base_volume > 1.0:
+        CONFIG["VOLUME_MULTIPLIER"] = max(1.0, round(1.0 + (base_volume - 1.0) * sens, 4))
+    else:
+        CONFIG["VOLUME_MULTIPLIER"] = max(0.1, round(base_volume * sens, 4))
+    cooldown_factor = max(0.4, sens)
+    CONFIG["PRE_SIGNAL_COOLDOWN"] = max(3, int(round(base_pre_cd * cooldown_factor)))
+    CONFIG["COOLDOWN_PER_SYMBOL"] = max(45, int(round(base_cd * max(0.5, sens))))
+    print(
+        "[CFG] Sensibilidade momentum aplicada (x"
+        f"{sens:.2f}): threshold {base_threshold:.4f}->{CONFIG['THRESHOLD_PCT']:.4f}, "
+        f"vol {base_volume:.3f}->{CONFIG['VOLUME_MULTIPLIER']:.3f}, cooldowns {base_pre_cd}/{base_cd}"
+        f"->{CONFIG['PRE_SIGNAL_COOLDOWN']}/{CONFIG['COOLDOWN_PER_SYMBOL']}"
+    )
+
+
+_apply_momentum_sensitivity()
 
 def _print_effective_config():
     print("\n[CFG] Config efetiva:")

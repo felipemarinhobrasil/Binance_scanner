@@ -48,6 +48,8 @@ RECOVER_COOLDOWN_S      = int(os.getenv("RECOVER_COOLDOWN_S", "180")) # evita re
 PARAQUEDAS_SLIP         = float(os.getenv("PANIC_SLIP", "0.003"))      # 0.3%
 PARAQUEDAS_SECS         = int(os.getenv("PANIC_SECS", "3"))
 STOP_LIMIT_TICKS = int(os.getenv("STOP_LIMIT_TICKS", "12"))
+STOP_LIMIT_GAP_PCT = float(os.getenv("STOP_LIMIT_GAP_PCT", "0.0015"))
+MIN_RISK_REWARD_RATIO = float(os.getenv("MIN_RISK_REWARD_RATIO", "1.3"))
 # ======= Filtro de volatilidade/momento =======
 VOL_FILTER_ENABLED = os.getenv("VOL_FILTER_ENABLED", "true").lower() in ("1","true","yes","y")
 VOL_WINDOW_MIN = int(os.getenv("VOL_WINDOW_MIN", "5"))            # janela mínima de leitura
@@ -184,6 +186,61 @@ def _fmt_price(p: float, tick: float) -> str:
 def _fmt_qty(q: float, step: float) -> str:
     dec = _tick_decimals(step)
     return f"{q:.{dec}f}"
+
+
+def _calc_stop_limit_price(stop_price: Optional[float], tick_size: float) -> Optional[float]:
+    """Calcula um preço limit válido para STOP_LOSS_LIMIT próximo ao stop."""
+    if stop_price is None:
+        return None
+    try:
+        stop_val = float(stop_price)
+        tick = float(tick_size)
+    except Exception:
+        return float(stop_price)
+    if tick <= 0:
+        return float(stop_val)
+    candidates: List[float] = []
+    base_candidate = _price_round(stop_val - tick, tick)
+    if base_candidate < stop_val:
+        candidates.append(base_candidate)
+    if STOP_LIMIT_TICKS > 0:
+        tick_candidate = _price_round(stop_val - STOP_LIMIT_TICKS * tick, tick)
+        if tick_candidate < stop_val:
+            candidates.append(tick_candidate)
+    if STOP_LIMIT_GAP_PCT > 0:
+        pct_candidate = _price_round(stop_val * (1 - STOP_LIMIT_GAP_PCT), tick)
+        if pct_candidate < stop_val:
+            candidates.append(pct_candidate)
+    if not candidates:
+        return base_candidate
+    return max(candidates)
+
+
+def _enforce_risk_reward(
+    take_profit_pct: Optional[float], stop_loss_pct: Optional[float]
+) -> tuple[Optional[float], Optional[float]]:
+    """Garante que o take profit tenha relação mínima com o stop loss."""
+    try:
+        tp = float(take_profit_pct) if take_profit_pct else None
+    except Exception:
+        tp = None
+    try:
+        sl = float(stop_loss_pct) if stop_loss_pct else None
+    except Exception:
+        sl = None
+    if not tp or not sl or sl <= 0:
+        return take_profit_pct, stop_loss_pct
+    if MIN_RISK_REWARD_RATIO <= 0:
+        return take_profit_pct, stop_loss_pct
+    current_ratio = tp / sl if sl else float("inf")
+    if current_ratio >= MIN_RISK_REWARD_RATIO:
+        return tp, sl
+    new_tp = sl * MIN_RISK_REWARD_RATIO
+    print(
+        "[RISK] Ajustando take_profit_pct de "
+        f"{tp:.6f} para {new_tp:.6f} (RR mínimo {MIN_RISK_REWARD_RATIO:.2f})"
+    )
+    return new_tp, sl
 # =========================
 # Helpers de verificação/heal
 # =========================
@@ -208,7 +265,7 @@ def verify_and_heal_post_sell(
     qty_str = _fmt_qty(qty_round, info["stepSize"])
     tp_round = _price_round(tp_price, info["tickSize"]) if tp_price is not None else None
     sp_round = _price_round(stop_price, info["tickSize"]) if stop_price is not None else None
-    stop_limit_price = _price_round(sp_round - STOP_LIMIT_TICKS * info["tickSize"], info["tickSize"]) if sp_round is not None else None
+    stop_limit_price = _calc_stop_limit_price(sp_round, info["tickSize"]) if sp_round is not None else None
     tp_str = _fmt_price(tp_round, info["tickSize"]) if tp_round is not None else None
     sp_str = _fmt_price(sp_round, info["tickSize"]) if sp_round is not None else None
     stop_limit_str = _fmt_price(stop_limit_price, info["tickSize"]) if stop_limit_price is not None else None
@@ -523,7 +580,7 @@ def place_oco_or_fallback(symbol: str, quantity: float, tp_price: float, stop_pr
     qty_str = _fmt_qty(qty_round, info["stepSize"])
     tp_round = _price_round(tp_price, info["tickSize"])
     sp_round = _price_round(stop_price, info["tickSize"])
-    stop_limit_price = _price_round(sp_round - STOP_LIMIT_TICKS * info["tickSize"], info["tickSize"])
+    stop_limit_price = _calc_stop_limit_price(sp_round, info["tickSize"])
     tp_str = _fmt_price(tp_round, info["tickSize"])
     sp_str = _fmt_price(sp_round, info["tickSize"])
     stop_limit_str = _fmt_price(stop_limit_price, info["tickSize"])
@@ -667,6 +724,8 @@ def buy_market_and_place_oco(
         executed_price = numerator / executed_qty if executed_qty > 0 else price_ref
     else:
         executed_price = price_ref
+    # Ajusta RR mínimo antes de calcular preços alvo
+    take_profit_pct, stop_loss_pct = _enforce_risk_reward(take_profit_pct, stop_loss_pct)
     # Define TP/SL a partir do preço executado
     tp_price = _price_round(executed_price * (1 + (take_profit_pct or 0.0)), info["tickSize"]) if take_profit_pct else None
     stop_price = _price_round(executed_price * (1 - (stop_loss_pct or 0.0)), info["tickSize"]) if stop_loss_pct else None
@@ -852,8 +911,8 @@ def monitor_and_recover_trade(symbol: str, executed_qty: float, tp_order_res, st
                 if last_ref <= 0:
                     print(f"[RECOVER] {symbol}: sem referência de book. Abortando.")
                     return
-                new_stop  = _price_round(last_ref - max(3, STOP_LIMIT_TICKS) * tick, tick)
-                new_limit = _price_round(new_stop - STOP_LIMIT_TICKS * tick, tick)
+                new_stop = _price_round(last_ref - max(3, STOP_LIMIT_TICKS) * tick, tick)
+                new_limit = _calc_stop_limit_price(new_stop, tick)
                 qty_str = _fmt_qty(_step_size_round(executed_qty, info["stepSize"]), info["stepSize"])
                 params_stop = {
                     "symbol": symbol,
@@ -866,8 +925,8 @@ def monitor_and_recover_trade(symbol: str, executed_qty: float, tp_order_res, st
                 }
                 stop_retry = safe_request_signed("POST", "/api/v3/order", params_stop)
                 if isinstance(stop_retry, dict) and stop_retry.get("error") and _is_trigger_immediately(stop_retry):
-                    new_stop  = _price_round(last_ref - 5*tick, tick)
-                    new_limit = _price_round(new_stop - STOP_LIMIT_TICKS * tick, tick)
+                    new_stop = _price_round(last_ref - 5 * tick, tick)
+                    new_limit = _calc_stop_limit_price(new_stop, tick)
                     params_stop["stopPrice"] = _fmt_price(new_stop,  tick)
                     params_stop["price"]     = _fmt_price(new_limit, tick)
                     stop_retry = safe_request_signed("POST", "/api/v3/order", params_stop)
