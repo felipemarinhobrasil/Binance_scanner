@@ -1,0 +1,12 @@
+services:
+  binance-scanner:
+    build: .
+    container_name: binance-scanner
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-America/Bahia}
+    volumes:
+      - ./data:/app/data
+    command: sh -lc "python -u monitor.py"
