@@ -51,10 +51,13 @@ STOP_LIMIT_TICKS = int(os.getenv("STOP_LIMIT_TICKS", "12"))
 # ======= Filtro de volatilidade/momento =======
 VOL_FILTER_ENABLED = os.getenv("VOL_FILTER_ENABLED", "true").lower() in ("1","true","yes","y")
 VOL_WINDOW_MIN = int(os.getenv("VOL_WINDOW_MIN", "5"))            # janela mínima de leitura
-MIN_RANGE_PCT = float(os.getenv("MIN_RANGE_PCT", "0.50"))         # exemplo: 0.50%
-MIN_MOMENTUM_PCT_1M = float(os.getenv("MIN_MOMENTUM_PCT_1M", "0.10"))  # mantém o nome por compatibilidade
+MIN_RANGE_PCT = float(os.getenv("MIN_RANGE_PCT", "0.45"))         # exemplo: 0.45%
+MIN_MOMENTUM_PCT_1M = float(os.getenv("MIN_MOMENTUM_PCT_1M", "0.08"))  # mantém o nome por compatibilidade
 MIN_QUOTE_VOL_5M = float(os.getenv("MIN_QUOTE_VOL_5M", "100.0"))  # volume em USDT somado no período
 MOM_LOOKBACK_MIN = int(os.getenv("MOM_LOOKBACK_MIN", "15"))       # janela robusta para momentum (padrão 15m)
+TARGET_EXIT_MINUTES = int(os.getenv("TARGET_EXIT_MINUTES", "15"))
+MIN_TARGET_RANGE_PCT = float(os.getenv("MIN_TARGET_RANGE_PCT", "1.05"))
+MIN_TARGET_CUM_MOVE_PCT = float(os.getenv("MIN_TARGET_CUM_MOVE_PCT", "1.4"))
 # cache para cooldown por símbolo
 _last_recover_attempt: dict[str, float] = {}
 # =========================
@@ -349,7 +352,7 @@ def check_symbol_volatility(symbol: str) -> tuple[bool, dict, str]:
     Retorna (ok, metrics, reason)
     """
     try:
-        N = max(5, VOL_WINDOW_MIN)  # janela mínima razoável
+        N = max(5, VOL_WINDOW_MIN, TARGET_EXIT_MINUTES)  # janela mínima razoável
         ks = _request_klines(symbol, "1m", N)
 
         # --- BOOK para spread ---
@@ -396,6 +399,29 @@ def check_symbol_volatility(symbol: str) -> tuple[bool, dict, str]:
             intra_last = abs(_pct(opens[-1], closes[-1]))
             mom_robust = max(mom_max_k, intra_last)
 
+            target_window = min(len(closes), max(2, TARGET_EXIT_MINUTES))
+            sub_highs = highs[-target_window:]
+            sub_lows = lows[-target_window:]
+            sub_closes = closes[-target_window:]
+            max_target = max(sub_highs) if sub_highs else max_h
+            min_target = min(sub_lows) if sub_lows else min_l
+            mid_target = (
+                (max_target + min_target) / 2.0
+                if (max_target + min_target) > 0
+                else (sub_closes[-1] if sub_closes else closes[-1])
+            )
+            range_target_pct = (
+                0.0
+                if mid_target == 0
+                else (max_target - min_target) / mid_target * 100.0
+            )
+            cum_move_target_pct = 0.0
+            for i in range(1, len(sub_closes)):
+                prev = sub_closes[i - 1]
+                cur = sub_closes[i]
+                if prev > 0:
+                    cum_move_target_pct += abs((cur - prev) / prev * 100.0)
+
             metrics = {
                 "range_pct": range_pct,
                 "momentum_1m_pct": mom_1m,
@@ -405,6 +431,9 @@ def check_symbol_volatility(symbol: str) -> tuple[bool, dict, str]:
                 "spread_pct": spread_pct,
                 "window_min": N,
                 "source": "klines",
+                "range_target_pct": range_target_pct,
+                "cum_move_target_pct": cum_move_target_pct,
+                "target_window_bars": len(sub_closes),
             }
         else:
             # ---- Fallback 24h (menos preciso) ----
@@ -421,6 +450,8 @@ def check_symbol_volatility(symbol: str) -> tuple[bool, dict, str]:
             midr = (high + low) / 2.0 if (high + low) > 0 else last
             range_pct = 0.0 if midr == 0 else (high - low) / midr * 100.0
 
+            approx_range_target = range_pct
+            approx_cum_target = abs(mom_1m)
             metrics = {
                 "range_pct": range_pct,
                 "momentum_1m_pct": mom_1m,
@@ -430,6 +461,9 @@ def check_symbol_volatility(symbol: str) -> tuple[bool, dict, str]:
                 "spread_pct": spread_pct,
                 "window_min": N,
                 "source": "24h",
+                "range_target_pct": approx_range_target,
+                "cum_move_target_pct": approx_cum_target,
+                "target_window_bars": 0,
             }
 
         # ---- Regras (inclui os novos cortes) ----
@@ -448,6 +482,20 @@ def check_symbol_volatility(symbol: str) -> tuple[bool, dict, str]:
         if metrics["momentum_robust_15m_pct"] < MIN_MOMENTUM_ROBUST_15M:
             return False, metrics, f"mom15m {metrics['momentum_robust_15m_pct']:.3f}% < {MIN_MOMENTUM_ROBUST_15M:.3f}%"
 
+        if metrics.get("target_window_bars", 0) >= max(2, TARGET_EXIT_MINUTES // 2):
+            if metrics["range_target_pct"] < MIN_TARGET_RANGE_PCT:
+                return (
+                    False,
+                    metrics,
+                    f"range{TARGET_EXIT_MINUTES}m {metrics['range_target_pct']:.3f}% < {MIN_TARGET_RANGE_PCT:.3f}%",
+                )
+            if metrics["cum_move_target_pct"] < MIN_TARGET_CUM_MOVE_PCT:
+                return (
+                    False,
+                    metrics,
+                    f"cumMove{TARGET_EXIT_MINUTES}m {metrics['cum_move_target_pct']:.3f}% < {MIN_TARGET_CUM_MOVE_PCT:.3f}%",
+                )
+
         return True, metrics, "ok"
 
     except Exception as e:
@@ -460,6 +508,9 @@ def check_symbol_volatility(symbol: str) -> tuple[bool, dict, str]:
             "avg_quote_vol_per_bar": 0.0,
             "spread_pct": 999.0,
             "source": "err",
+            "range_target_pct": 0.0,
+            "cum_move_target_pct": 0.0,
+            "target_window_bars": 0,
         }
         return False, m, f"erro volatilidade: {e}"
 
@@ -625,7 +676,10 @@ def buy_market_and_place_oco(
         else:
             print(f"[VOL-FILTER] {symbol} OK "
                   f"(src={m.get('source','?')}) — range={m['range_pct']:.3f}% "
-                  f"mom1m={m['momentum_1m_pct']:.3f}% qVolSum={m['quote_vol_sum']:.2f}")
+                  f"mom1m={m['momentum_1m_pct']:.3f}% "
+                  f"range{TARGET_EXIT_MINUTES}m={m.get('range_target_pct', 0.0):.3f}% "
+                  f"cum{TARGET_EXIT_MINUTES}m={m.get('cum_move_target_pct', 0.0):.3f}% "
+                  f"qVolSum={m['quote_vol_sum']:.2f}")
     # usa ask (bookTicker) como referência de “preço de entrada” para cálculo TP/SL
     t = _request_public("/api/v3/ticker/bookTicker", params={"symbol": symbol})
     ask = float(t["askPrice"])

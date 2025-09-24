@@ -5,6 +5,7 @@ Binance Spot Momentum Scanner (Docker-ready)
 
 import asyncio
 import json
+import math
 import os
 import signal
 import time
@@ -70,8 +71,8 @@ def _auto_endpoints():
 _BASE_URL, _WS_URL, _IS_TESTNET = _auto_endpoints()
 
 CONFIG = {
-    "THRESHOLD_PCT": _get_float("THRESHOLD_PCT", 0.03),          # 3% no candle
-    "VOLUME_MULTIPLIER": _get_float("VOLUME_MULTIPLIER", 1.3),   # >= 1.3x média
+    "THRESHOLD_PCT": _get_float("THRESHOLD_PCT", 0.025),         # 2.5% no candle por padrão
+    "VOLUME_MULTIPLIER": _get_float("VOLUME_MULTIPLIER", 1.15),  # >= 1.15x média
     "VOL_LOOKBACK": _get_int("VOL_LOOKBACK", 60),                # média de volume
     "INTERVAL": _get_env("INTERVAL", "1m"),
     "DEBUG_PRE_SIGNAL": _get_bool("DEBUG_PRE_SIGNAL", True),
@@ -93,6 +94,10 @@ CONFIG = {
     "INCLUDE_LEVERAGED": _get_bool("INCLUDE_LEVERAGED", False),
     "BATCH_SIZE": _get_int("BATCH_SIZE", 800),
     "USE_TESTNET": _IS_TESTNET,
+    "TARGET_EXIT_MINUTES": _get_int("TARGET_EXIT_MINUTES", 15),
+    "MIN_TARGET_RANGE_PCT": _get_float("MIN_TARGET_RANGE_PCT", 1.05),
+    "MIN_TARGET_CUM_MOVE_PCT": _get_float("MIN_TARGET_CUM_MOVE_PCT", 1.4),
+    "EXIT_CHECK_COOLDOWN": _get_int("EXIT_CHECK_COOLDOWN", 45),
 }
 
 def _print_effective_config():
@@ -100,7 +105,8 @@ def _print_effective_config():
     keys = [
         "USE_TESTNET","BASE","WS","QUOTE_FILTER","INTERVAL",
         "THRESHOLD_PCT","VOLUME_MULTIPLIER","VOL_LOOKBACK",
-        "COOLDOWN_PER_SYMBOL","BATCH_SIZE",
+        "COOLDOWN_PER_SYMBOL","BATCH_SIZE","TARGET_EXIT_MINUTES",
+        "MIN_TARGET_RANGE_PCT","MIN_TARGET_CUM_MOVE_PCT",
         "SEND_HEATMAP_TO_TELEGRAM","HEATMAP_MIN_PCT_FOR_TELEGRAM","HEATMAP_TELEGRAM_COOLDOWN"
     ]
     for k in keys:
@@ -121,6 +127,9 @@ class SymbolState:
     last_alert_ts: float = 0.0
     last_vol_fetch_ts: float = 0.0
     last_pre_log_ts: float = 0.0
+    last_exit_check_ts: float = 0.0
+    last_exit_check_ok: bool = False
+    last_exit_metrics: Optional[Dict[str, float]] = None
 
 REPORTER_LAST_SIG: Optional[Tuple] = None
 REPORTER_LAST_TELEGRAM_TS: float = 0.0
@@ -218,6 +227,98 @@ def chunked(lst: List[str], n: int) -> List[List[str]]:
     return [lst[i:i + n] for i in range(0, len(lst), n)]
 
 # =========================
+# Checagem adicional de volatilidade (janela alvo)
+# =========================
+def _interval_to_minutes(interval: str) -> float:
+    try:
+        unit = interval[-1]
+        value = float(interval[:-1])
+    except Exception:
+        return 1.0
+    if unit == "m":
+        return max(1.0, value)
+    if unit == "h":
+        return max(1.0, value * 60.0)
+    if unit == "d":
+        return max(1.0, value * 1440.0)
+    if unit == "w":
+        return max(1.0, value * 10080.0)
+    if unit == "M":  # mês aproximado
+        return max(1.0, value * 43200.0)
+    return 1.0
+
+def check_exit_window_volatility(symbol: str) -> Tuple[bool, Dict[str, float]]:
+    interval_minutes = _interval_to_minutes(CONFIG["INTERVAL"])
+    target_window_min = max(2, CONFIG["TARGET_EXIT_MINUTES"])
+    bars_needed = int(math.ceil(target_window_min / interval_minutes))
+    bars_needed = max(2, bars_needed)
+
+    limit = max(CONFIG["VOL_LOOKBACK"], bars_needed)
+    try:
+        kl = get_klines(symbol, CONFIG["INTERVAL"], limit=limit)
+    except Exception as exc:
+        print(f"[VOL-EXIT] erro {symbol}: {exc}")
+        return False, {
+            "range_pct": 0.0,
+            "cum_move_pct": 0.0,
+            "avg_move_pct": 0.0,
+            "bars": 0,
+            "interval_minutes": interval_minutes,
+            "window_minutes": 0.0,
+            "reason": "request_error",
+        }
+
+    if len(kl) < 2:
+        return False, {
+            "range_pct": 0.0,
+            "cum_move_pct": 0.0,
+            "avg_move_pct": 0.0,
+            "bars": len(kl),
+            "interval_minutes": interval_minutes,
+            "window_minutes": len(kl) * interval_minutes,
+            "reason": "insufficient_bars",
+        }
+
+    subset = kl[-bars_needed:]
+    highs = [float(x[2]) for x in subset]
+    lows = [float(x[3]) for x in subset]
+    closes = [float(x[4]) for x in subset]
+
+    max_h = max(highs)
+    min_l = min(lows)
+    mid = (max_h + min_l) / 2.0 if (max_h + min_l) > 0 else (closes[-1] if closes else 0.0)
+    range_pct = 0.0 if mid == 0 else (max_h - min_l) / mid * 100.0
+
+    cum_move_pct = 0.0
+    for i in range(1, len(closes)):
+        prev = closes[i - 1]
+        cur = closes[i]
+        if prev > 0:
+            cum_move_pct += abs((cur - prev) / prev * 100.0)
+
+    avg_move_pct = cum_move_pct / max(1, len(closes) - 1)
+    window_minutes = len(closes) * interval_minutes
+
+    metrics = {
+        "range_pct": range_pct,
+        "cum_move_pct": cum_move_pct,
+        "avg_move_pct": avg_move_pct,
+        "bars": len(closes),
+        "interval_minutes": interval_minutes,
+        "window_minutes": window_minutes,
+    }
+
+    ok = (
+        range_pct >= CONFIG["MIN_TARGET_RANGE_PCT"]
+        and cum_move_pct >= CONFIG["MIN_TARGET_CUM_MOVE_PCT"]
+    )
+
+    if not ok:
+        metrics["reason"] = "threshold"
+
+    return ok, metrics
+
+# =========================
 # Processamento dos klines
 # =========================
 def process_kline_msg(state: Dict[str, SymbolState], msg: dict) -> Optional[str]:
@@ -256,19 +357,49 @@ def process_kline_msg(state: Dict[str, SymbolState], msg: dict) -> Optional[str]
     pct_ok = pct >= CONFIG["THRESHOLD_PCT"]
 
     if vol_ok and pct_ok:
+        need_exit_check = (
+            st.last_exit_metrics is None
+            or (now_ts - st.last_exit_check_ts) > CONFIG["EXIT_CHECK_COOLDOWN"]
+        )
+        if need_exit_check:
+            exit_ok, metrics = check_exit_window_volatility(symbol)
+            st.last_exit_check_ts = now_ts
+            st.last_exit_check_ok = exit_ok
+            st.last_exit_metrics = metrics
+        if not st.last_exit_check_ok:
+            if CONFIG["DEBUG_PRE_SIGNAL"] and st.last_exit_metrics:
+                print(
+                    f"[PRE] {symbol} rejeitado no filtro {CONFIG['TARGET_EXIT_MINUTES']}m: "
+                    f"range={st.last_exit_metrics.get('range_pct', 0.0):.2f}% "
+                    f"cum={st.last_exit_metrics.get('cum_move_pct', 0.0):.2f}%"
+                )
+            return None
         if now_ts - st.last_alert_ts < CONFIG["COOLDOWN_PER_SYMBOL"]:
             return None
         st.last_alert_ts = now_ts
         ts = now_tz().strftime("%Y-%m-%d %H:%M:%S %Z")
-        return "\n".join(
-            [
-                f"🚀 MOMENTUM {symbol}",
-                f"Tempo: {ts}",
-                f"Preço: {st.close:.8f}",
-                f"Candle {CONFIG['INTERVAL']}: {fmt_pct(pct)} (de {st.open_price:.8f} p/ {st.close:.8f})",
-                f"Volume atual: {st.volume:.3f} (média {st.vol_avg:.3f})",
-            ]
-        )
+        lines = [
+            f"🚀 MOMENTUM {symbol}",
+            f"Tempo: {ts}",
+            f"Preço: {st.close:.8f}",
+            f"Candle {CONFIG['INTERVAL']}: {fmt_pct(pct)} (de {st.open_price:.8f} p/ {st.close:.8f})",
+            f"Volume atual: {st.volume:.3f} (média {st.vol_avg:.3f})",
+        ]
+        if st.last_exit_metrics:
+            window_minutes = st.last_exit_metrics.get("window_minutes") or (
+                CONFIG["TARGET_EXIT_MINUTES"]
+            )
+            lines.append(
+                "Janela {wm:.0f}m: range {rng:.2f}% | mov acum {cum:.2f}%".format(
+                    wm=window_minutes,
+                    rng=st.last_exit_metrics.get("range_pct", 0.0),
+                    cum=st.last_exit_metrics.get("cum_move_pct", 0.0),
+                )
+            )
+            lines.append(
+                f"Média por candle: {st.last_exit_metrics.get('avg_move_pct', 0.0):.2f}%"
+            )
+        return "\n".join(lines)
     return None
 
 # =========================
