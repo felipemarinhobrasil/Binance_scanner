@@ -1189,15 +1189,115 @@ def _parse_csv_rows(path: str) -> list[dict]:
     rows = []
     try:
         import csv
-        with open(path, newline="") as f:
+
+        def _normalize(row: dict) -> dict:
+            normalized: dict[str, Any] = {}
+            for key, value in (row or {}).items():
+                if key is None:
+                    continue
+                if isinstance(key, str):
+                    key = key.strip().lstrip("\ufeff")
+                new_val = value.strip() if isinstance(value, str) else value
+                if key in normalized:
+                    existing = normalized[key]
+                    if (existing in (None, "") or (isinstance(existing, str) and not existing.strip())) and new_val not in (None, ""):
+                        normalized[key] = new_val
+                else:
+                    normalized[key] = new_val
+            return normalized
+
+        with open(path, newline="", encoding="utf-8-sig") as f:
             r = csv.DictReader(f)
             for row in r:
-                rows.append(row)
+                rows.append(_normalize(row))
     except FileNotFoundError:
         pass
     except Exception as e:
         print("[DAILY] erro lendo CSV:", e)
     return rows
+
+
+def _parse_timestamp_any(value: Any) -> Optional[datetime.datetime]:
+    if isinstance(value, datetime.datetime):
+        dt = value
+    else:
+        if isinstance(value, (int, float)):
+            try:
+                val = float(value)
+            except (TypeError, ValueError):
+                return None
+            if val > 1e12:
+                val /= 1000.0
+            try:
+                dt = datetime.datetime.fromtimestamp(val, tz=datetime.timezone.utc)
+            except Exception:
+                return None
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            try:
+                dt = datetime.datetime.fromisoformat(text)
+            except ValueError:
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+                    try:
+                        dt = datetime.datetime.strptime(text, fmt)
+                        break
+                    except ValueError:
+                        continue
+                else:
+                    try:
+                        val = float(text)
+                    except ValueError:
+                        return None
+                    if val > 1e12:
+                        val /= 1000.0
+                    try:
+                        dt = datetime.datetime.fromtimestamp(val, tz=datetime.timezone.utc)
+                    except Exception:
+                        return None
+        else:
+            return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    else:
+        dt = dt.astimezone(datetime.timezone.utc)
+    return dt
+
+
+def _coerce_float(value: Any) -> float:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return 0.0
+        text = text.replace("%", "")
+        if "," in text and "." not in text:
+            text = text.replace(",", ".")
+        else:
+            text = text.replace(",", "")
+        try:
+            return float(text)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _parse_pct_ratio(value: Any) -> float:
+    if isinstance(value, str):
+        has_percent = value.strip().endswith("%")
+        val = _coerce_float(value)
+        if has_percent or abs(val) > 10:
+            return val / 100.0
+        return val
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        val = float(value)
+        return (val / 100.0) if abs(val) > 10 else val
+    return 0.0
 def _to_tz(dt_utc: datetime.datetime, tz_name: str) -> datetime.datetime:
     # timestamp_utc no CSV está em ISO, UTC. Convertemos para timezone local.
     if dt_utc.tzinfo is None:
@@ -1220,30 +1320,45 @@ def _today_bounds(tz_name: str) -> tuple[datetime.datetime, datetime.datetime]:
     return start_utc, end_utc
 def _summarize(rows: Iterable[dict], start_utc: datetime.datetime, end_utc: datetime.datetime) -> dict:
     items = []
-    for r in rows:
-        try:
-            ts = datetime.datetime.fromisoformat(r.get("timestamp_utc", ""))
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=datetime.timezone.utc)
-        except Exception:
+    for raw in rows:
+        if not isinstance(raw, dict):
             continue
-        if not (start_utc <= ts < end_utc):
+        ts = None
+        for key in ("timestamp_utc", "timestamp", "ts", "time", "closed_at"):
+            ts = _parse_timestamp_any(raw.get(key))
+            if ts is not None:
+                break
+        if ts is None or not (start_utc <= ts < end_utc):
             continue
-        try:
-            pnl_pct = float(r.get("pnl_pct", 0))
-            pnl_usdt = float(r.get("pnl_usdt", 0))
-            items.append({
-                "symbol": r.get("symbol","?"),
-                "pnl_pct": pnl_pct,
-                "pnl_usdt": pnl_usdt,
-                "buy_price": float(r.get("buy_price", 0)),
-                "exit_price": float(r.get("exit_price", 0)),
-                "qty": float(r.get("qty", 0)),
-                "reason": r.get("reason",""),
-                "ts": ts,
-            })
-        except Exception:
-            continue
+
+        buy_price = _coerce_float(raw.get("buy_price"))
+        exit_price = _coerce_float(raw.get("exit_price"))
+        qty = _coerce_float(raw.get("qty"))
+        pnl_usdt = _coerce_float(raw.get("pnl_usdt"))
+
+        pnl_pct_ratio: Optional[float] = None
+        if buy_price > 0 and exit_price > 0:
+            pnl_pct_ratio = (exit_price - buy_price) / buy_price
+            computed_pnl = (exit_price - buy_price) * qty if qty else 0.0
+            if qty > 0 and abs(pnl_usdt) < 1e-12 and abs(computed_pnl) > 0:
+                pnl_usdt = computed_pnl
+        if (pnl_pct_ratio is None or abs(pnl_pct_ratio) < 1e-12) and buy_price > 0 and qty > 0 and pnl_usdt != 0:
+            denom = buy_price * qty
+            if denom:
+                pnl_pct_ratio = pnl_usdt / denom
+        if pnl_pct_ratio is None:
+            pnl_pct_ratio = _parse_pct_ratio(raw.get("pnl_pct"))
+
+        items.append({
+            "symbol": str(raw.get("symbol", "?")).strip() or "?",
+            "pnl_pct": pnl_pct_ratio or 0.0,
+            "pnl_usdt": pnl_usdt,
+            "buy_price": buy_price,
+            "exit_price": exit_price,
+            "qty": qty,
+            "reason": raw.get("reason", "") or "",
+            "ts": ts,
+        })
     total = len(items)
     wins = sum(1 for x in items if x["pnl_usdt"] > 0)
     win_rate = (wins/total*100) if total else 0.0

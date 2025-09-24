@@ -19,11 +19,16 @@ from pytz import timezone
 
 # === trader.py (compra + OCO + monitor de PnL) ===
 try:
-    from trader import buy_market_and_place_oco, monitor_open_trades  # type: ignore
+    from trader import (
+        buy_market_and_place_oco,
+        monitor_open_trades,
+        daily_summary_loop,
+    )  # type: ignore
 except Exception as _imp_exc:
     print("[WARN] Falha ao importar trader.py:", _imp_exc)
     buy_market_and_place_oco = None
     monitor_open_trades = None  # type: ignore
+    daily_summary_loop = None  # type: ignore
 
 # Dicionário compartilhado com trader.monitor_open_trades
 open_trades: Dict[str, Any] = {}
@@ -69,6 +74,12 @@ def _auto_endpoints():
 
 _BASE_URL, _WS_URL, _IS_TESTNET = _auto_endpoints()
 
+_TELEGRAM_TOKEN = _get_env("TELEGRAM_BOT_TOKEN", "")
+_TELEGRAM_CHAT_ID = _get_env("TELEGRAM_CHAT_ID", "")
+_DAILY_SUMMARY_ENABLED = _get_bool(
+    "DAILY_SUMMARY_ENABLED", bool(_TELEGRAM_TOKEN and _TELEGRAM_CHAT_ID)
+)
+
 CONFIG = {
     "THRESHOLD_PCT": _get_float("THRESHOLD_PCT", 0.03),          # 3% no candle
     "VOLUME_MULTIPLIER": _get_float("VOLUME_MULTIPLIER", 1.3),   # >= 1.3x média
@@ -78,13 +89,15 @@ CONFIG = {
     "PRE_SIGNAL_COOLDOWN": _get_int("PRE_SIGNAL_COOLDOWN", 15),
     "REPORT_TOP_MOVERS_EVERY": _get_int("REPORT_TOP_MOVERS_EVERY", 10),
     "TOP_MOVERS_N": _get_int("TOP_MOVERS_N", 15),
-    "TELEGRAM_TOKEN": _get_env("TELEGRAM_BOT_TOKEN", ""),
-    "TELEGRAM_CHAT_ID": _get_env("TELEGRAM_CHAT_ID", ""),
+    "TELEGRAM_TOKEN": _TELEGRAM_TOKEN,
+    "TELEGRAM_CHAT_ID": _TELEGRAM_CHAT_ID,
     "SEND_HEATMAP_TO_TELEGRAM": _get_bool("SEND_HEATMAP_TO_TELEGRAM", True),
     "HEATMAP_TELEGRAM_COOLDOWN": _get_int("HEATMAP_TELEGRAM_COOLDOWN", 120),
     "HEATMAP_MIN_PCT_FOR_TELEGRAM": _get_float("HEATMAP_MIN_PCT_FOR_TELEGRAM", 0.02),
     "HEATMAP_ONLY_WHEN_CHANGED": _get_bool("HEATMAP_ONLY_WHEN_CHANGED", True),
     "HEATMAP_TOP_SIGNATURE_SIZE": _get_int("HEATMAP_TOP_SIGNATURE_SIZE", 5),
+    "DAILY_SUMMARY_ENABLED": _DAILY_SUMMARY_ENABLED,
+    "DAILY_SUMMARY_SEND_AT": _get_env("DAILY_SUMMARY_SEND_AT", "21:00"),
     "TZ": _get_env("TZ", "America/Bahia"),
     "COOLDOWN_PER_SYMBOL": _get_int("COOLDOWN_PER_SYMBOL", 180),
     "BASE": _BASE_URL,
@@ -101,7 +114,8 @@ def _print_effective_config():
         "USE_TESTNET","BASE","WS","QUOTE_FILTER","INTERVAL",
         "THRESHOLD_PCT","VOLUME_MULTIPLIER","VOL_LOOKBACK",
         "COOLDOWN_PER_SYMBOL","BATCH_SIZE",
-        "SEND_HEATMAP_TO_TELEGRAM","HEATMAP_MIN_PCT_FOR_TELEGRAM","HEATMAP_TELEGRAM_COOLDOWN"
+        "SEND_HEATMAP_TO_TELEGRAM","HEATMAP_MIN_PCT_FOR_TELEGRAM","HEATMAP_TELEGRAM_COOLDOWN",
+        "DAILY_SUMMARY_ENABLED","DAILY_SUMMARY_SEND_AT"
     ]
     for k in keys:
         print(f"  - {k} = {CONFIG[k]}")
@@ -417,6 +431,25 @@ async def scanner_loop():
     print(f"[INFO] Total de conexões WS: {len(batches)} (batch={CONFIG['BATCH_SIZE']})")
     tasks = [asyncio.create_task(ws_worker(batch, state, i)) for i, batch in enumerate(batches)]
     tasks.append(asyncio.create_task(reporter_loop(state)))
+    if daily_summary_loop and CONFIG.get("DAILY_SUMMARY_ENABLED"):
+        raw_send_at = CONFIG.get("DAILY_SUMMARY_SEND_AT", "21:00")
+        send_at = (raw_send_at or "").strip() or "21:00"
+        valid_time = True
+        try:
+            hh, mm = map(int, send_at.split(":"))
+            if hh not in range(24) or mm not in range(60):
+                raise ValueError
+        except Exception:
+            print(f"[WARN] DAILY_SUMMARY_SEND_AT inválido: '{raw_send_at}'. Resumo diário desabilitado.")
+            valid_time = False
+        if valid_time:
+            if not (CONFIG.get("TELEGRAM_TOKEN") and CONFIG.get("TELEGRAM_CHAT_ID")):
+                print("[WARN] DAILY_SUMMARY_ENABLED=1 mas Telegram não está configurado; resumo diário não será iniciado.")
+            else:
+                print(f"[INFO] Resumo diário habilitado para {send_at} (timezone {CONFIG['TZ']}).")
+                tasks.append(asyncio.create_task(daily_summary_loop(CONFIG["TZ"], send_at)))
+    elif CONFIG.get("DAILY_SUMMARY_ENABLED"):
+        print("[WARN] daily_summary_loop indisponível (trader.py?). Resumo diário não será executado.")
     await asyncio.gather(*tasks)
 
 def handle_sigint(signum, frame):
