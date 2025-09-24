@@ -1218,14 +1218,51 @@ def _today_bounds(tz_name: str) -> tuple[datetime.datetime, datetime.datetime]:
     start_utc = start_local.astimezone(datetime.timezone.utc)
     end_utc = end_local.astimezone(datetime.timezone.utc)
     return start_utc, end_utc
+def _parse_timestamp_utc(value: str) -> Optional[datetime.datetime]:
+    """Parse timestamps stored in the CSV (be tolerant with legacy formats)."""
+
+    if not value:
+        return None
+
+    raw = value.strip()
+    if not raw:
+        return None
+
+    # Aceita sufixos legados "Z"/" UTC" como UTC explícito.
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    elif raw.endswith(" UTC"):
+        raw = raw[:-4] + "+00:00"
+
+    parsed: Optional[datetime.datetime] = None
+    try:
+        parsed = datetime.datetime.fromisoformat(raw)
+    except ValueError:
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S.%f",
+            "%Y-%m-%dT%H:%M:%S.%f",
+        ):
+            try:
+                parsed = datetime.datetime.strptime(raw, fmt)
+                break
+            except ValueError:
+                continue
+
+    if not parsed:
+        return None
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
+
+
 def _summarize(rows: Iterable[dict], start_utc: datetime.datetime, end_utc: datetime.datetime) -> dict:
     items = []
     for r in rows:
-        try:
-            ts = datetime.datetime.fromisoformat(r.get("timestamp_utc", ""))
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=datetime.timezone.utc)
-        except Exception:
+        ts = _parse_timestamp_utc(r.get("timestamp_utc", ""))
+        if not ts:
             continue
         if not (start_utc <= ts < end_utc):
             continue
